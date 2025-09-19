@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Demo - Catálogo de Liquidación</title>
+
+<!-- Librerías CDN -->
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; padding:18px; max-width:1100px; margin:auto;}
+  h1{margin-bottom:6px}
+  .controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  label.btn{background:#0b5ed7;color:white;padding:8px 12px;border-radius:6px;cursor:pointer;display:inline-block}
+  input[type=file]{display:none}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  th,td{border:1px solid #ddd;padding:8px;text-align:left;}
+  .card{border:1px solid #e2e2e2;padding:10px;border-radius:8px;margin-bottom:10px;display:flex;gap:10px;align-items:flex-start}
+  .thumbs img{height:80px;width:auto;margin-right:6px;border-radius:4px}
+  .category-block{margin-top:18px}
+  .meta{font-size:0.9rem;color:#444}
+  .actions{margin-top:10px}
+  .small{font-size:0.85rem;color:#666}
+  .hidden{display:none}
+  /* Vista imprimible */
+  @media print{
+    body{max-width:100%;padding:8px}
+    .controls, .no-print{display:none}
+    .card{page-break-inside:avoid;border:1px solid #000}
+    th,td{border:1px solid #000}
+  }
+</style>
+</head>
+<body>
+  <h1>Demo: Catálogo de Liquidación</h1>
+  <div class="controls no-print">
+    <label class="btn">Cargar CSV<input id="csv-file" type="file" accept=".csv" /></label>
+    <input id="csv-url" placeholder="Pegar URL CSV/Google Sheets (export?format=csv)" style="flex:1;padding:8px;border-radius:6px;border:1px solid #ccc" />
+    <button id="load-csv-url" class="btn">Importar desde URL</button>
+    <button id="export-json" class="btn" style="background:#28a745">Exportar JSON</button>
+    <button id="print" class="btn" style="background:#6c757d">Vista imprimible / PDF</button>
+  </div>
+
+  <div id="status" class="small">Esperando CSV...</div>
+
+  <div id="catalog"></div>
+
+<script>
+/* Estructura esperada CSV headers (insensible mayúsc/minus):
+   Referencia,Descripcion,Cantidad,Precio,Categoria,Imagen1_URL,Imagen2_URL
+*/
+const status = document.getElementById('status');
+const catalogEl = document.getElementById('catalog');
+let items = []; // cada item: {id,referencia,descripcion,cantidad,precio,categoria,images:[{file, dataUrl or url}]}
+
+function renderCatalog(){
+  catalogEl.innerHTML = '';
+  if(items.length===0){ status.textContent='No hay artículos cargados'; return }
+  status.textContent = items.length + ' artículo(s) cargado(s)';
+
+  // Agrupar por categoria
+  const groups = {};
+  items.forEach(it => {
+    const cat = it.categoria || 'Sin categoría';
+    if(!groups[cat]) groups[cat]=[];
+    groups[cat].push(it);
+  });
+
+  for(const [cat, list] of Object.entries(groups)){
+    const block = document.createElement('div');
+    block.className = 'category-block';
+    block.innerHTML = '<h2>'+cat+'</h2>';
+    list.forEach(it => {
+      const card = document.createElement('div');
+      card.className='card';
+      const left = document.createElement('div');
+      left.style.flex='1';
+      left.innerHTML = `
+        <strong>${escapeHtml(it.referencia)}</strong> — <span class="meta">${escapeHtml(it.descripcion)}</span><br/>
+        <div class="small">Cantidad: ${escapeHtml(it.cantidad)} | Precio: ${escapeHtml(it.precio)}</div>
+      `;
+      const right = document.createElement('div');
+      right.style.width='300px';
+      right.innerHTML = `
+        <div class="thumbs" id="thumbs-${it.id}"></div>
+        <div class="actions no-print">
+          <label class="btn small">Subir imágenes<input type="file" accept="image/*" multiple data-id="${it.id}"></label>
+          <button class="btn small" data-id="${it.id}" onclick="removeItem(event)" style="background:#d9534f">Eliminar</button>
+        </div>
+      `;
+      card.appendChild(left);
+      card.appendChild(right);
+      block.appendChild(card);
+      catalogEl.appendChild(block);
+      updateThumbs(it);
+    });
+  }
+}
+
+function escapeHtml(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])) }
+
+function updateThumbs(it){
+  const thumbs = document.getElementById('thumbs-'+it.id);
+  if(!thumbs) return;
+  thumbs.innerHTML = '';
+  it.images = it.images || [];
+  it.images.slice(0,3).forEach((img, i) => {
+    const imgEl = document.createElement('img');
+    imgEl.src = img.dataUrl || img.url;
+    imgEl.alt = `${it.referencia} img ${i+1}`;
+    thumbs.appendChild(imgEl);
+  });
+  // si hay menos de 3 slots, mostrar placeholders
+  for(let k=it.images.length;k<3;k++){
+    const ph = document.createElement('img');
+    ph.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><rect width="100%" height="100%" fill="#f2f2f2"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-size="12" fill="#999">sin imagen</text></svg>');
+    ph.style.opacity='0.6';
+    thumbs.appendChild(ph);
+  }
+}
+
+// Manejo carga CSV local
+document.getElementById('csv-file').addEventListener('change', (ev)=>{
+  const f = ev.target.files[0];
+  if(!f) return;
+  Papa.parse(f, {header:true, skipEmptyLines:true, complete: (res)=> {
+    loadFromParsed(res.data);
+  }});
+});
+
+// Import desde URL (p.ej Google Sheets export CSV)
+document.getElementById('load-csv-url').addEventListener('click', ()=>{
+  const url = document.getElementById('csv-url').value.trim();
+  if(!url){ alert('Pega la URL CSV o la URL de exportación de Google Sheets.'); return; }
+  status.textContent = 'Cargando desde URL...';
+  Papa.parse(url, {download:true, header:true, skipEmptyLines:true, complete: (res)=> {
+    loadFromParsed(res.data);
+  }, error: (err)=> {
+    status.textContent = 'Error cargando CSV: '+err;
+    console.error(err);
+  }});
+});
+
+function loadFromParsed(rows){
+  items = [];
+  let idCounter=1;
+  rows.forEach(r=>{
+    // Mapeo de columnas (insensible a mayúsculas)
+    const mapKey = key => {
+      const found = Object.keys(r).find(k => k && k.toLowerCase().trim() === key.toLowerCase());
+      return found ? r[found] : '';
+    };
+    const referencia = mapKey('Referencia') || mapKey('REF') || mapKey('reference') || '';
+    const descripcion = mapKey('Descripcion') || mapKey('Descripcion') || mapKey('Description') || '';
+    const cantidad = mapKey('Cantidad') || '1';
+    const precio = mapKey('Precio') || mapKey('Price') || '';
+    const categoria = mapKey('Categoria') || mapKey('Category') || '';
+    const img1 = mapKey('Imagen1_URL') || mapKey('Image1') || '';
+    const img2 = mapKey('Imagen2_URL') || '';
+    const item = { id: idCounter++, referencia: referencia, descripcion: descripcion, cantidad: cantidad, precio: precio, categoria: categoria, images: [] };
+    if(img1) item.images.push({ url: img1 });
+    if(img2) item.images.push({ url: img2 });
+    items.push(item);
+  });
+  renderCatalog();
+  attachImageInputs(); // vuelve a enlazar inputs
+}
+
+function attachImageInputs(){
+  // cada botón file dentro del catálogo
+  document.querySelectorAll('input[type=file][data-id]').forEach(inp=>{
+    inp.addEventListener('change', async (ev)=>{
+      const id = ev.target.dataset.id;
+      const it = items.find(x=>x.id==id);
+      if(!it) return;
+      const files = Array.from(ev.target.files).slice(0,3);
+      for(const f of files){
+        const dataUrl = await fileToDataUrl(f);
+        it.images = it.images || [];
+        it.images.push({ fileName: f.name, dataUrl: dataUrl });
+      }
+      updateThumbs(it);
+      ev.target.value = '';
+    });
+  });
+}
+
+function fileToDataUrl(file){ return new Promise((res,rej)=>{
+  const fr = new FileReader();
+  fr.onload = ()=>res(fr.result);
+  fr.onerror = e=>rej(e);
+  fr.readAsDataURL(file);
+});}
+
+// Export JSON (incluye dataURLs para imágenes añadidas)
+document.getElementById('export-json').addEventListener('click', ()=>{
+  const exportData = items.map(it=>({
+    referencia: it.referencia, descripcion: it.descripcion, cantidad: it.cantidad, precio: it.precio, categoria: it.categoria,
+    images: (it.images||[]).map(im => ({ url: im.url || null, dataUrl: im.dataUrl || null, fileName: im.fileName || null }))
+  }));
+  const blob = new Blob([JSON.stringify(exportData, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='catalogo.json'; document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+});
+
+// Print / generar PDF (usa impresión del navegador)
+document.getElementById('print').addEventListener('click', ()=>{
+  // Asegurar que se cargaron thumbs en DOM
+  window.print();
+});
+
+// Eliminar item
+function removeItem(e){
+  const id = e.currentTarget.dataset.id;
+  items = items.filter(x=>x.id!=id);
+  renderCatalog();
+  attachImageInputs();
+}
+
+// Inicial: ejemplo
+function loadSample(){
+  const sample = [
+    { id:1, referencia:'REF-001', descripcion:'Camisa blanca talla M', cantidad:'5', precio:'$12.000', categoria:'Ropa', images:[] },
+    { id:2, referencia:'REF-002', descripcion:'Zapatos deportivos', cantidad:'3', precio:'$25.000', categoria:'Calzado', images:[] },
+    { id:3, referencia:'REF-003', descripcion:'Reloj clásico', cantidad:'2', precio:'$8.500', categoria:'Accesorios', images:[] }
+  ];
+  items = sample;
+  renderCatalog();
+  attachImageInputs();
+}
+
+// Helpers
+renderCatalog();
+loadSample();
+setTimeout(()=>attachImageInputs(),300);
+
+/* Nota: si tras cargar CSV no ves inputs para imágenes, presiona "Subir imágenes" debajo de la ficha.
+   Para usar Google Sheets:
+   - En Google Sheets: Archivo → Publicar en la web → Select sheet → CSV
+   - Copia la URL de la publicación o usa: https://docs.google.com/spreadsheets/d/<ID>/export?format=csv&gid=<GID>
+*/
+</script>
+</body>
+</html>
